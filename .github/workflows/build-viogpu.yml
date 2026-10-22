@@ -21,8 +21,12 @@ jobs:
         include:
           - platform: x64
             arch: amd64
+            msbuild_extra: ''
+          # ApiValidator of the runner's WDK cannot run on ARM64 binaries (exit code 193,
+          # ERROR_BAD_EXE_FORMAT); the drivers themselves build fine.
           - platform: ARM64
             arch: arm64
+            msbuild_extra: /p:ApiValidator_Enable=false
     steps:
       - uses: actions/checkout@v4
 
@@ -30,7 +34,7 @@ jobs:
 
       - name: Build viogpu
         shell: cmd
-        run: msbuild viogpu\viogpu.sln -maxCpuCount /p:Configuration="${{ matrix.config }}" /p:Platform=${{ matrix.platform }}
+        run: msbuild viogpu\viogpu.sln -maxCpuCount /p:Configuration="${{ matrix.config }}" /p:Platform=${{ matrix.platform }} ${{ matrix.msbuild_extra }}
 
       - name: Collect driver package
         shell: pwsh
