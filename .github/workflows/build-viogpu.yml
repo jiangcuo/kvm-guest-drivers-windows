@@ -1,0 +1,52 @@
+name: build-viogpu
+
+# Builds the viogpudo display driver (and its resolution helpers) unsigned.
+# Signing is done afterwards, outside CI.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'viogpu/**'
+      - 'build/**'
+      - '.github/workflows/build-viogpu.yml'
+
+jobs:
+  build:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ['Win10 Release', 'Win11 Release']
+        platform: [x64, ARM64]
+        include:
+          - platform: x64
+            arch: amd64
+          - platform: ARM64
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build viogpu
+        shell: cmd
+        run: msbuild viogpu\viogpu.sln -maxCpuCount /p:Configuration="${{ matrix.config }}" /p:Platform=${{ matrix.platform }}
+
+      - name: Collect driver package
+        shell: pwsh
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          $out = "package"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          # Output directories name the architecture (amd64/x64 or arm64), never both.
+          $pattern = if ($env:ARCH -eq 'arm64') { '(?i)\\arm64\\' } else { '(?i)\\(amd64|x64)\\' }
+          Get-ChildItem viogpu -Recurse -Include viogpudo.sys,viogpudo.inf,viogpudo.cat,viogpudo.pdb,vgpusrv.exe,viogpuap.exe |
+            Where-Object { $_.FullName -match $pattern } |
+            Copy-Item -Destination $out -Force
+          Get-ChildItem $out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viogpudo-${{ matrix.config == 'Win10 Release' && 'win10' || 'win11' }}-${{ matrix.arch }}-unsigned
+          path: package
