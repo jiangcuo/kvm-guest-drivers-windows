@@ -3991,10 +3991,7 @@ BOOLEAN VioGpuAdapter::UpdateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPoin
     if (pSetPointerShape->Width > POINTER_SIZE || pSetPointerShape->Height > POINTER_SIZE)
     {
         DbgPrint(TRACE_LEVEL_ERROR,
-                 ("<--- %s Cursor too large %dx%d\n",
-                  __FUNCTION__,
-                  pSetPointerShape->Width,
-                  pSetPointerShape->Height));
+                 ("<--- %s Cursor too large %dx%d\n", __FUNCTION__, pSetPointerShape->Width, pSetPointerShape->Height));
         return FALSE;
     }
 
