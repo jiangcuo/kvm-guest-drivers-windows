@@ -171,6 +171,7 @@ class VioGpuAdapter : IVioGpuPCI
     void DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer);
     BOOLEAN CreateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape, _In_ CONST CURRENT_MODE *pCurrentMode);
     BOOLEAN UpdateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape, _In_ CONST CURRENT_MODE *pCurrentMode);
+    void ConvertCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape);
     void DestroyCursor(void);
     BOOLEAN GpuObjectAttach(UINT res_id, VioGpuObj *obj);
     void static ThreadWork(_In_ PVOID Context);
@@ -216,6 +217,13 @@ class VioGpuAdapter : IVioGpuPCI
     // Hot spot of the current shape, replayed by the UPDATE_CURSOR that re-attaches the sprite after a hide.
     UINT m_CursorHotX;
     UINT m_CursorHotY;
+    // Signalled when the control queue has processed the cursor image upload. UPDATE_CURSOR travels on the
+    // cursor queue, which the device processes independently of the control queue: sent right after the
+    // upload, it is often handled first and the device then shows the previous image. A member rather than
+    // a stack variable, so a completion arriving after a wait timeout still signals valid memory.
+    KEVENT m_CursorUploadEvent;
+    // Monochrome and masked color shapes converted to ARGB, guarded by m_CursorMutex.
+    UINT32 m_CursorArgb[POINTER_SIZE * POINTER_SIZE];
     VioGpuMemSegment m_CursorSegment;
     VioGpuMemSegment m_FrameSegment;
     volatile ULONG m_PendingWorks;

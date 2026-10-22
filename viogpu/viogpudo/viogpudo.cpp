@@ -50,6 +50,8 @@ VioGpuDod::VioGpuDod(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
     *((UINT *)&m_Flags) = 0;
+    // Hardware cursor on unless the HWCursor registry value turns it off.
+    m_Flags.PointerEnabled = TRUE;
     RtlZeroMemory(&m_DxgkInterface, sizeof(m_DxgkInterface));
     RtlZeroMemory(&m_DeviceInfo, sizeof(m_DeviceInfo));
     RtlZeroMemory(&m_CurrentMode, sizeof(m_CurrentMode));
@@ -2320,6 +2322,7 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_bCursorHidden = TRUE;
     m_CursorHotX = 0;
     m_CursorHotY = 0;
+    KeInitializeEvent(&m_CursorUploadEvent, NotificationEvent, FALSE);
     m_PendingWorks = 0;
     m_bStopWorkThread = FALSE;
     m_pWorkThread = NULL;
@@ -2971,12 +2974,6 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
               pSetPointerShape->Height,
               pSetPointerShape->XHot,
               pSetPointerShape->YHot));
-
-    if (pSetPointerShape->Flags.Monochrome)
-    {
-        VioGpuDbgBreak();
-        return STATUS_UNSUCCESSFUL;
-    }
 
     // The image upload and the UPDATE_CURSOR below must not interleave with a concurrent MOVE_CURSOR
     // issued by SetPointerPosition on another thread (see m_CursorMutex).
@@ -3991,6 +3988,16 @@ BOOLEAN VioGpuAdapter::UpdateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPoin
     Rect.right = Rect.left + pSetPointerShape->Width;
     Rect.bottom = Rect.top + pSetPointerShape->Height;
 
+    if (pSetPointerShape->Width > POINTER_SIZE || pSetPointerShape->Height > POINTER_SIZE)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("<--- %s Cursor too large %dx%d\n",
+                  __FUNCTION__,
+                  pSetPointerShape->Width,
+                  pSetPointerShape->Height));
+        return FALSE;
+    }
+
     if ((m_pCursorBuf == NULL) && !CreateCursor(pSetPointerShape, pCurrentMode))
     {
         VioGpuDbgBreak();
@@ -4009,11 +4016,17 @@ BOOLEAN VioGpuAdapter::UpdateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPoin
     DstBltInfo.Height = POINTER_SIZE;
 
     BLT_INFO SrcBltInfo;
-    SrcBltInfo.pBits = (PVOID)pSetPointerShape->pPixels;
-    SrcBltInfo.Pitch = pSetPointerShape->Pitch;
-    if (pSetPointerShape->Flags.Color)
+    SrcBltInfo.BitsPerPel = BPPFromPixelFormat(D3DDDIFMT_A8R8G8B8);
+    if (pSetPointerShape->Flags.Monochrome || pSetPointerShape->Flags.MaskedColor)
     {
-        SrcBltInfo.BitsPerPel = BPPFromPixelFormat(D3DDDIFMT_A8R8G8B8);
+        ConvertCursor(pSetPointerShape);
+        SrcBltInfo.pBits = m_CursorArgb;
+        SrcBltInfo.Pitch = pSetPointerShape->Width * 4;
+    }
+    else if (pSetPointerShape->Flags.Color)
+    {
+        SrcBltInfo.pBits = (PVOID)pSetPointerShape->pPixels;
+        SrcBltInfo.Pitch = pSetPointerShape->Pitch;
     }
     else
     {
@@ -4027,12 +4040,99 @@ BOOLEAN VioGpuAdapter::UpdateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPoin
     SrcBltInfo.Width = pSetPointerShape->Width;
     SrcBltInfo.Height = pSetPointerShape->Height;
 
+    // The device always shows the whole POINTER_SIZE x POINTER_SIZE resource: clear what a larger previous
+    // shape left outside the new one, and upload all of it.
+    RtlZeroMemory(DstBltInfo.pBits, POINTER_SIZE * POINTER_SIZE * 4);
     BltBits(&DstBltInfo, &SrcBltInfo, &Rect);
 
-    m_CtrlQueue.TransferToHost2D(m_pCursorBuf->GetId(), 0, pSetPointerShape->Width, pSetPointerShape->Height, 0, 0);
+    // Wait until the device has the new image before the caller sends UPDATE_CURSOR (see
+    // m_CursorUploadEvent). Same ordering as the Linux virtio-gpu driver, which waits for a fence here.
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = Int32x32To64(100, -10000);
+    KeClearEvent(&m_CursorUploadEvent);
+    m_CtrlQueue.TransferToHost2D(m_pCursorBuf->GetId(), 0, POINTER_SIZE, POINTER_SIZE, 0, 0, &m_CursorUploadEvent);
+    if (KeWaitForSingleObject(&m_CursorUploadEvent, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s Cursor upload timed out\n", __FUNCTION__));
+    }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return TRUE;
+}
+
+// Converts a monochrome (AND + XOR 1 bpp masks) or masked color (ARGB, alpha 0 = opaque, 0xFF = XOR)
+// shape into plain ARGB in m_CursorArgb. The device cursor has no XOR: inverted pixels become black and
+// the transparent pixels around them white, so the shape stays visible on any background.
+void VioGpuAdapter::ConvertCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape)
+{
+    PAGED_CODE();
+    const UINT width = pSetPointerShape->Width;
+    const UINT height = pSetPointerShape->Height;
+    const UINT32 transparent = 0x00000000;
+    const UINT32 black = 0xFF000000;
+    const UINT32 white = 0xFFFFFFFF;
+    // Marks an inverted pixel until the last pass below.
+    const UINT32 inverted = 0x00FFFFFF;
+    const BYTE *pixels = (const BYTE *)pSetPointerShape->pPixels;
+
+    for (UINT y = 0; y < height; y++)
+    {
+        UINT32 *out = &m_CursorArgb[y * width];
+        if (pSetPointerShape->Flags.Monochrome)
+        {
+            const BYTE *andMask = pixels + y * pSetPointerShape->Pitch;
+            const BYTE *xorMask = pixels + (height + y) * pSetPointerShape->Pitch;
+            for (UINT x = 0; x < width; x++)
+            {
+                const BYTE bit = (BYTE)(0x80 >> (x & 7));
+                const BOOLEAN a = (andMask[x >> 3] & bit) != 0;
+                const BOOLEAN xr = (xorMask[x >> 3] & bit) != 0;
+                out[x] = a ? (xr ? inverted : transparent) : (xr ? white : black);
+            }
+        }
+        else
+        {
+            const UINT32 *row = (const UINT32 *)(pixels + y * pSetPointerShape->Pitch);
+            for (UINT x = 0; x < width; x++)
+            {
+                const UINT32 rgb = row[x] & 0x00FFFFFF;
+                if ((row[x] >> 24) == 0)
+                {
+                    out[x] = black | rgb;
+                }
+                else
+                {
+                    out[x] = rgb == 0 ? transparent : inverted;
+                }
+            }
+        }
+    }
+
+    // Outline the inverted pixels so they show on dark backgrounds too.
+    for (UINT y = 0; y < height; y++)
+    {
+        for (UINT x = 0; x < width; x++)
+        {
+            UINT32 *px = &m_CursorArgb[y * width + x];
+            if (*px != transparent)
+            {
+                continue;
+            }
+            if ((x > 0 && px[-1] == inverted) || (x + 1 < width && px[1] == inverted) ||
+                (y > 0 && *(px - width) == inverted) || (y + 1 < height && px[width] == inverted))
+            {
+                *px = white;
+            }
+        }
+    }
+
+    for (UINT i = 0; i < width * height; i++)
+    {
+        if (m_CursorArgb[i] == inverted)
+        {
+            m_CursorArgb[i] = black;
+        }
+    }
 }
 
 void VioGpuAdapter::DestroyCursor()
